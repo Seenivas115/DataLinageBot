@@ -2,14 +2,20 @@ import os
 import re
 import json
 
-def fix_query_in_text(text):
-    """Fix real newlines inside 'query' values."""
+def strong_fix_query(text):
+    """Fix both newlines and unescaped quotes inside 'query' fields."""
     def replacer(match):
         content = match.group(1)
-        fixed_content = content.replace('\n', '\\n')
-        return f'"query": "{fixed_content}"'
-    
-    pattern = r'"query"\s*:\s*"([^"]*?)"'
+        # Escape backslashes first
+        content = content.replace('\\', '\\\\')
+        # Escape double quotes
+        content = content.replace('"', '\\"')
+        # Escape real newlines
+        content = content.replace('\n', '\\n')
+        return f'"query": "{content}"'
+
+    # regex to match "query": "...."
+    pattern = r'"query"\s*:\s*"((?:[^"\\]|\\.)*?)"'
     fixed_text = re.sub(pattern, replacer, text, flags=re.DOTALL)
     return fixed_text
 
@@ -20,7 +26,7 @@ def process_folder(folder_path, backup=True):
             with open(filepath, "r", encoding="utf-8-sig") as f:
                 raw_text = f.read()
 
-            fixed_text = fix_query_in_text(raw_text)
+            fixed_text = strong_fix_query(raw_text)
 
             try:
                 data = json.loads(fixed_text)
