@@ -1,30 +1,32 @@
 import os
+import re
 import json
 
-def fix_multiline_query(json_data):
-    """Recursively fix 'query' fields in JSON to escape newlines."""
-    if isinstance(json_data, dict):
-        for key, value in json_data.items():
-            if key == "query" and isinstance(value, str):
-                json_data[key] = value.replace('\n', '\\n')
-            else:
-                fix_multiline_query(value)
-    elif isinstance(json_data, list):
-        for item in json_data:
-            fix_multiline_query(item)
+def fix_query_in_text(text):
+    """Fix real newlines inside 'query' values."""
+    def replacer(match):
+        content = match.group(1)
+        fixed_content = content.replace('\n', '\\n')
+        return f'"query": "{fixed_content}"'
+    
+    pattern = r'"query"\s*:\s*"([^"]*?)"'
+    fixed_text = re.sub(pattern, replacer, text, flags=re.DOTALL)
+    return fixed_text
 
 def process_folder(folder_path, backup=True):
     for filename in os.listdir(folder_path):
         if filename.endswith(".json"):
             filepath = os.path.join(folder_path, filename)
             with open(filepath, "r", encoding="utf-8-sig") as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError as e:
-                    print(f"Skipping {filename}: JSON error -> {e}")
-                    continue
+                raw_text = f.read()
 
-            fix_multiline_query(data)
+            fixed_text = fix_query_in_text(raw_text)
+
+            try:
+                data = json.loads(fixed_text)
+            except json.JSONDecodeError as e:
+                print(f"Still invalid: {filename} -> {e}")
+                continue
 
             output_path = filepath
             if backup:
@@ -35,5 +37,5 @@ def process_folder(folder_path, backup=True):
             print(f"Fixed: {filename} -> {output_path}")
 
 if __name__ == "__main__":
-    folder = "./conformed"   # <- put your folder path here
-    process_folder(folder, backup=True)  # Set backup=False if you want to overwrite
+    folder = "./conformed"  # <-- adjust your folder
+    process_folder(folder, backup=True)
