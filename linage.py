@@ -2,12 +2,37 @@ import os
 import json
 import sqlparse
 from sqlparse.sql import IdentifierList, Identifier, Function
-from sqlparse.tokens import DML, Name, Wildcard
+from sqlparse.tokens import DML, Name, Wildcard, Keyword
 from collections import defaultdict
 
 # Set up layers and paths
 LAYER_ORDER = ["raw", "sanitized", "conformed", "curated"]
 LAYER_DIRS = {layer: f"./{layer}" for layer in LAYER_ORDER}
+
+
+def extract_table_aliases(stmt):
+    """Extract table aliases or real names from FROM and JOIN clauses."""
+    aliases = {}
+    from_seen = False
+    for token in stmt.tokens:
+        if token.is_group:
+            aliases.update(extract_table_aliases(token))
+        if token.ttype is Keyword and token.value.upper() in ("FROM", "JOIN"):
+            from_seen = True
+        elif from_seen:
+            if isinstance(token, Identifier):
+                real_table = token.get_real_name()
+                alias = token.get_alias() or real_table
+                aliases[alias] = real_table
+                from_seen = False
+            elif isinstance(token, IdentifierList):
+                for identifier in token.get_identifiers():
+                    real_table = identifier.get_real_name()
+                    alias = identifier.get_alias() or real_table
+                    aliases[alias] = real_table
+                from_seen = False
+    return aliases
+
 
 def extract_columns_and_sources(query):
     parsed = sqlparse.parse(query)
@@ -17,28 +42,36 @@ def extract_columns_and_sources(query):
         if stmt.get_type() != "SELECT":
             continue
 
-        tokens = stmt.tokens
+        alias_map = extract_table_aliases(stmt)
         select_seen = False
 
-        for token in tokens:
+        for token in stmt.tokens:
             if token.ttype is DML and token.value.upper() == "SELECT":
                 select_seen = True
             elif select_seen:
                 if isinstance(token, IdentifierList):
                     for identifier in token.get_identifiers():
-                        output_col = identifier.get_alias() or identifier.get_real_name()
-                        input_cols = [t.value for t in identifier.tokens if t.ttype in (Name, Wildcard)]
-                        col_map[output_col] = input_cols
+                        col_name = identifier.get_alias() or identifier.get_real_name()
+                        src_table = identifier.get_parent_name()
+                        if src_table and src_table in alias_map:
+                            col_map[col_name] = [f"{alias_map[src_table]}.{identifier.get_real_name()}"]
+                        else:
+                            col_map[col_name] = [identifier.get_real_name()]
                 elif isinstance(token, Identifier):
-                    output_col = token.get_alias() or token.get_real_name()
-                    input_cols = [t.value for t in token.tokens if t.ttype in (Name, Wildcard)]
-                    col_map[output_col] = input_cols
+                    col_name = token.get_alias() or token.get_real_name()
+                    src_table = token.get_parent_name()
+                    if src_table and src_table in alias_map:
+                        col_map[col_name] = [f"{alias_map[src_table]}.{token.get_real_name()}"]
+                    else:
+                        col_map[col_name] = [token.get_real_name()]
                 elif isinstance(token, Function):
-                    output_col = token.get_alias() or token.get_real_name()
-                    input_cols = [t.value for t in token.tokens if t.ttype == Name]
-                    col_map[output_col] = input_cols
+                    col_name = token.get_alias() or token.get_real_name()
+                    inputs = [t.value for t in token.tokens if t.ttype in (Name, Wildcard)]
+                    col_map[col_name] = inputs
                 break
+
     return col_map
+
 
 def parse_all_jsons():
     lineage_dict = {}
@@ -59,19 +92,32 @@ def parse_all_jsons():
                 except json.JSONDecodeError:
                     continue
 
-            flows = data.get("flows", {}).get("flow", [])
-            for flow in flows:
-                query = flow.get("queryFetch") or flow.get("query", "")
-                output_table = flow.get("registerAsName") or flow.get("saveOutputTable", "")
-                if not query or not output_table:
-                    continue
-
-                col_lineage = extract_columns_and_sources(query)
-                for out_col, input_cols in col_lineage.items():
-                    out_fq = f"{output_table}.{out_col}"
-                    lineage_dict[out_fq] = input_cols
+            for app in data.get("applications", []):
+                for job in app.get("jobs", []):
+                    for tag in job.get("tags", []):
+                        # Process flows
+                        for flow in tag.get("flows", []):
+                            query = flow.get("queryFetch") or flow.get("query", "")
+                            output_table = flow.get("registerAsName") or flow.get("saveOutputTable", "")
+                            if not query or not output_table:
+                                continue
+                            col_lineage = extract_columns_and_sources(query)
+                            for out_col, input_cols in col_lineage.items():
+                                out_fq = f"{output_table}.{out_col}"
+                                lineage_dict[out_fq] = input_cols
+                        # Process ingestion
+                        for ingestion in tag.get("ingestion", []):
+                            query = ingestion.get("queryFetch") or ingestion.get("query", "")
+                            output_table = ingestion.get("registerAsName") or ingestion.get("saveOutputTable", "")
+                            if not query or not output_table:
+                                continue
+                            col_lineage = extract_columns_and_sources(query)
+                            for out_col, input_cols in col_lineage.items():
+                                out_fq = f"{output_table}.{out_col}"
+                                lineage_dict[out_fq] = input_cols
 
     return lineage_dict
+
 
 def convert_lineage_to_text(lineage_dict):
     lines = []
@@ -83,9 +129,11 @@ def convert_lineage_to_text(lineage_dict):
         lines.append(line)
     return "\n\n".join(lines)
 
+
 def save_lineage_text(lineage_text, filename="lineage_context.txt"):
     with open(filename, "w", encoding="utf-8") as f:
         f.write(lineage_text)
+
 
 def main():
     lineage_dict = parse_all_jsons()
@@ -93,6 +141,7 @@ def main():
     save_lineage_text(lineage_text)
     print("✅ Lineage extraction complete.")
     print("Saved context to: lineage_context.txt")
+
 
 if __name__ == "__main__":
     main()
